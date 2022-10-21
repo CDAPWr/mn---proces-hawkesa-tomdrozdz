@@ -1,0 +1,177 @@
+---
+title: Hawkes
+author: Tomasz Dróżdż
+output: pdf_document
+---
+
+```{r}
+library(evently)
+library(ggplot2)
+library(scales)
+```
+
+Badam problem rozprzestrzeniania się tweetów, który nadaje się do modelowania procesem Hawkesa z racji tego, iż jest to proces samopobudzające się (popularność tweeta rośnie wraz z jego udostępnianiem), którego intensywność maleje wraz z czasem (bez udostępnień popularność spada).
+
+Jako że mamy dostęp do liczby obserwujących osoby, która udostępnia tweeta, jest to proces znakowany (marked). Wybieram kernel z funkcją power-law (testowałem również funkcję eksponencjalną), gdyż z badań Rizoiu wynika, że działa ona lepiej dla problemów mediów społecznościowych.
+
+```{r}
+tweets <- read.csv(file = 'index.csv', 
+                   colClasses = c('character', 'numeric', 'integer', 'integer'))
+retweets <- read.csv(file = 'data.csv', colClasses = c('integer', 'integer'))
+
+tweets$cascade_length = tweets$end_ind - tweets$start_ind + 1
+```
+
+Z opisu zbioru:
+
+> We only kept tweets such that it has at least 50 retweets, the text of the tweet does not contain a pound sign # (hashtag), and the language of the original poster is English.
+
+```{r}
+cat("Number of tweets:", nrow(tweets))
+
+tweets[1:10,]
+```
+
+\newpage
+
+```{r}
+cat("Number of retweets:", comma(nrow(retweets)))
+
+retweets[1:10,]
+```
+
+```{r}
+cascade_lifetime <- retweets[tweets$end_ind, 1] / (60 * 60)
+ggplot(as.data.frame(cascade_lifetime), aes(x = cascade_lifetime)) +
+  geom_histogram(bins = 100, color = "darkblue", fill = "lightblue") +
+  labs(title = "Histogram of cascade lifetimes in hours",
+       x = "cascade lifetime [h]")
+```
+
+\newpage
+
+```{r}
+cat("Median followers count:", median(retweets$number_of_followers), "\n")
+cat("Number of accounts with less than a million followers:",
+    comma(nrow(retweets[retweets$number_of_followers < 1000000, ])),
+    "\n")
+
+followers <- retweets[retweets$number_of_followers >= 1000000, 2]
+ggplot(as.data.frame(followers), aes(x = followers)) +
+  geom_histogram(bins = 20, color = "darkblue", fill = "lightblue") +
+  labs(title = "Histogram of number of followers of accounts retweeting (> 1,000,000)",
+       x = "number of followers") +
+  scale_x_continuous(labels = comma)
+```
+
+```{r}
+prepare_cascade <- function(tweet_idx) {
+  tweet <- tweets[tweet_idx, ]
+  cascade <- retweets[tweet$start_ind:tweet$end_ind, ]
+  colnames(cascade) <- c("time", "magnitude")
+  return (cascade[, c(2, 1)])
+}
+```
+
+\newpage
+
+```{r}
+prepare_cascade(3)[1:10, ]
+```
+
+```{r}
+cat("Median cascade length:", median(tweets$cascade_length))
+
+br = seq(0, 34000, by = 1000)
+
+ranges <- paste(head(br, -1), br[-1], sep=" - ")
+freq <-  hist(tweets$cascade_length, breaks=br, include.lowest=TRUE, plot=FALSE)
+
+freq_df <- data.frame(cascade_length = ranges, frequency = freq$counts)
+freq_df[freq_df$frequency > 0, ]
+```
+
+\newpage
+
+```{r}
+fit_model <- function(cascade) {
+  train_time <- cascade[2, 2] + (60 * 60)
+  train_rows <- cascade[cascade$time < train_time,]
+  
+  cat("Fitting cascade of length", nrow(cascade), "\n")
+  cat("Using first",
+      comma(train_time),
+      "seconds for training -",
+      nrow(train_rows),
+      "tweets\n\n")
+  
+  fitted_model <-
+    fit_series(
+      train_rows,
+      model_type = 'mPL',
+      observation_time = max(train_rows$time),
+      cores = 20
+    )
+  
+  branching_factor <- get_branching_factor(fitted_model)
+  cat("Branching factor:", branching_factor, "\n\n")
+  
+  if (branching_factor < 1) {
+    predicted_popularity <- predict_final_popularity(fitted_model)
+    real_popularity <- nrow(cascade)
+    
+    cat("Predicted final popularity:", predicted_popularity, "\n")
+    cat("Real final popularity:", real_popularity, "\n")
+    cat("Relative error:",
+        sprintf(
+          "%0.2f%%",
+          100 * abs(predicted_popularity - real_popularity) / real_popularity
+        ),
+        "\n\n")
+  }
+  
+  return (fitted_model)
+}
+```
+
+```{r}
+cascade_1 <- prepare_cascade(28)
+model_1 <- fit_model(cascade_1)
+plot_event_series(model_1)
+```
+
+```{r}
+cascade_2 <- prepare_cascade(45)
+model_2 <- fit_model(cascade_2)
+plot_event_series(model_2)
+```
+
+```{r}
+ggplot(cascade_1, aes(x=time, y=magnitude)) + geom_point(size=2, color="blue") +
+  scale_x_continuous(labels = comma) + scale_y_continuous(labels = comma) +
+  labs(title="Cascade 1")
+```
+
+```{r}
+ggplot(cascade_2, aes(x=time, y=magnitude)) + geom_point(size=2, color="blue") +
+  scale_x_continuous(labels = comma) + scale_y_continuous(labels = comma) +
+  labs(title="Cascade 2")
+```
+
+```{r}
+comma(model_1$par)
+```
+
+```{r}
+comma(model_2$par)
+```
+
+\newpage
+
+Wartość *K* modelu trenowanego na pierwszej kaskadzie jest znacznie większa, niż wartość K modelu trenowanego na drugiej kasadzie, co oznacza, że dany tweet będzie szybciej się rozprzestrzeniał (zwiększa intensywność procesu o większą wartość, jako że jest ona skalowana przez *K*).
+
+Wartość *beta* jest większa dla modelu wytrenowanego na drugiej kaskadzie, co oznacza, że liczba obserwujących osobę retweetującą ma w nim większe znaczenie i będzie w większym stopniu zwiększać intensywność procesu.
+
+Wartość parametru *c* jest większa dla modelu wytrenowanego na drugiej kasadzie, co sugeruje, że znajduje się w niej więcej zbliżonych w czasie zdarzeń przy wysokiej wartości funkcji intensywności (*c* wprowadza przesunięcie, aby ogarniczyć wartość funkcji intensywności, gdy zdarzenia następują w krótkich odstępach czasu).
+
+Model wytrenowany na drugiej kaskadzie ma większą wartość *thety*, co oznacza, że zdarzenia są szybciej zapominane (intensywność procesu szybciej spada wraz z upływem czasu).
